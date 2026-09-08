@@ -1,0 +1,16 @@
+State Provenance
+
+Copyright 2026 Summon Software Labs
+
+State Provenance is an open-source, vendor-neutral runtime for provenance, derivation, lineage, dependency, compatibility, generation, authority, and reuse-eligibility semantics for machine-produced AI state.
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file in this distribution for the full license text.
+
+State Provenance does not collect or transmit any telemetry. All telemetry is
+written to local files chosen by the operator and never leaves the machine
+running the software.
+
+State Provenance accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
+Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
