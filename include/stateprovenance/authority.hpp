@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -61,7 +62,20 @@ public:
     std::uint64_t epoch() const { return epoch_; }
     void set_epoch(std::uint64_t e) { epoch_ = (e == 0) ? 1 : e; }
 
-    void register_boot(WorkerId worker, WorkerBootId boot) { boot_[worker] = boot; }
+    // Makes `boot` the worker's current boot and retires the boot it replaces.
+    // A retired boot never becomes current again (returns false, no change):
+    // a restarted worker's old incarnation cannot take its authority back by
+    // registering again.
+    bool register_boot(WorkerId worker, WorkerBootId boot) {
+        auto rit = retired_.find(worker);
+        if (rit != retired_.end() && rit->second.count(boot)) return false;
+        auto it = boot_.find(worker);
+        if (it != boot_.end() && it->second != boot) retired_[worker].insert(it->second);
+        boot_[worker] = boot;
+        return true;
+    }
+    void retire_boot(WorkerId worker, WorkerBootId boot) { retired_[worker].insert(boot); }
+    const std::map<WorkerId, std::set<WorkerBootId>>& retired_boots() const { return retired_; }
     std::optional<WorkerBootId> boot_of(WorkerId worker) const {
         auto it = boot_.find(worker);
         if (it == boot_.end()) return std::nullopt;
@@ -159,6 +173,7 @@ private:
 
     std::uint64_t epoch_ = 1;
     std::map<WorkerId, WorkerBootId> boot_;
+    std::map<WorkerId, std::set<WorkerBootId>> retired_;
     AttemptId attempt_id_;
     AttemptGeneration attempt_generation_;
     StateGeneration state_generation_;

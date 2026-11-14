@@ -153,6 +153,17 @@ inline ReuseDecision evaluate_reuse(const ProvenanceRecord& rec, const ReuseRequ
     dim_check(CompatibilityDimension::ArtifactGen,
               id_req_set(req.artifact_generation), id_req_set(r.artifact_generation),
               req.artifact_generation == r.artifact_generation, "artifact generation");
+    {
+        // Every declared dependency must be at the requested dependency generation.
+        bool rec_set = false, match = true;
+        for (const auto& dep : r.dependencies) {
+            if (!dep.generation.valid()) continue;
+            rec_set = true;
+            if (dep.generation != req.dependency_generation) match = false;
+        }
+        dim_check(CompatibilityDimension::DependencyGen,
+                  id_req_set(req.dependency_generation), rec_set, match, "dependency generation");
+    }
 
     // Deterministic outcome precedence.
     if (r.validity == ValidityState::INVALIDATED) {

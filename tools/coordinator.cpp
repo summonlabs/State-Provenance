@@ -22,6 +22,7 @@ using namespace stateprovenance::spnet;
 
 namespace {
 std::atomic<bool> g_stopping{false};
+std::atomic<int> g_listen{-1};   // listening socket; closed once to stop accepting
 std::atomic<long long> g_accepted{0};
 std::atomic<long long> g_rejected{0};
 std::mutex g_count_mu;
@@ -56,7 +57,10 @@ static void handle_connection(int conn) {
                     BinaryReader r(payload.data(), payload.size());
                     std::uint64_t wid, bid;
                     r.u64(wid); r.u64(bid);
-                    g_store.register_boot(WorkerId(wid), WorkerBootId(bid));
+                    if (!g_store.register_boot(WorkerId(wid), WorkerBootId(bid))) {
+                        send_frame(conn, static_cast<std::uint8_t>(Op::Respond), "err:stale WorkerBootId (superseded)");
+                        break;
+                    }
                 }
                 send_frame(conn, static_cast<std::uint8_t>(Op::Respond), authority_summary());
                 break;
@@ -157,6 +161,10 @@ static void handle_connection(int conn) {
             case Op::Shutdown: {
                 send_frame(conn, static_cast<std::uint8_t>(Op::Respond), "bye");
                 g_stopping.store(true);
+                // Closing the listening socket wakes the blocked accept() so the
+                // coordinator actually exits.
+                int ls = g_listen.exchange(-1);
+                if (ls >= 0) close_socket(ls);
                 return;
             }
             default:
@@ -176,7 +184,12 @@ int main(int argc, char** argv) {
     if (argc >= 4 && std::string(argv[3]) == "load") {
         auto lr = load_file(argv[2]);
         if (lr.snapshot) {
-            g_store.restore(*lr.snapshot);
+            try {
+                g_store.restore(*lr.snapshot);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "load failed: %s\n", e.what());
+                return 3;
+            }
             std::printf("LOADED digest=%s\n", g_store.store_digest(*lr.snapshot).c_str());
             std::fflush(stdout);
         } else {
@@ -188,6 +201,7 @@ int main(int argc, char** argv) {
     int ls = listen_socket(static_cast<std::uint16_t>(port));
     if (ls < 0) { std::fprintf(stderr, "cannot listen on port %d\n", port); return 1; }
     std::uint16_t actual = local_port(ls);
+    g_listen.store(ls);
     std::printf("LISTENING %u\n", actual);
     std::fflush(stdout);
 
@@ -201,7 +215,8 @@ int main(int argc, char** argv) {
         std::thread t(handle_connection, conn);
         t.detach();
     }
-    close_socket(ls);
+    int open_ls = g_listen.exchange(-1);
+    if (open_ls >= 0) close_socket(open_ls);
     cleanup();
     std::printf("COORD_EXIT accepted=%lld rejected=%lld\n", g_accepted.load(), g_rejected.load());
     std::fflush(stdout);

@@ -54,6 +54,18 @@ static std::string read_until(Proc& p, const std::string& marker) {
     return acc;
 }
 
+// Reads until a complete line containing `marker` has arrived (or EOF).
+static std::string read_line_with(Proc& p, const std::string& marker) {
+    std::string acc; char buf[256]; DWORD got = 0;
+    for (;;) {
+        std::size_t m = acc.find(marker);
+        if (m != std::string::npos && acc.find('\n', m) != std::string::npos) break;
+        if (!p.read || !ReadFile(p.read, buf, sizeof(buf), &got, nullptr) || got == 0) break;
+        acc.append(buf, got);
+    }
+    return acc;
+}
+
 static void kill(Proc& p) {
     if (p.h) { TerminateProcess(p.h, 0); WaitForSingleObject(p.h, 3000); CloseHandle(p.h); p.h = nullptr; }
     if (p.read) { CloseHandle(p.read); p.read = nullptr; }
@@ -178,6 +190,16 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     std::printf("[5] restarted worker A with fresh WorkerBootId %s\n", BA2.to_string().c_str()); std::fflush(stdout);
 
+    // ----- 5b. The killed incarnation's boot registers again (a zombie) -----
+    std::string a2_reg = read_line_with(workerA2, "WORKER_REGISTER");
+    REQUIRE(a2_reg.find("err:") == std::string::npos, "restarted worker A registered its fresh WorkerBootId");
+    Proc zombie = spawn(worker_exe, std::to_string(port) + " " + WA.to_string() + " " +
+                      BA1.to_string() + " register 0");
+    std::string zr = read_line_with(zombie, "WORKER_REGISTER");
+    std::printf("[5b] superseded WorkerBootId %s registers again -> %s\n", BA1.to_string().c_str(),
+                zr.find("err:") != std::string::npos ? "refused" : "ACCEPTED"); std::fflush(stdout);
+    REQUIRE(zr.find("err:") != std::string::npos, "superseded WorkerBootId cannot register again");
+
     // ----- 6. Replay stale mutations over the REAL transport -----
     std::printf("[6] replaying stale authority over real TCP transport\n"); std::fflush(stdout);
     int rejected = 0;
@@ -263,8 +285,14 @@ int main(int argc, char** argv) {
     std::string stop = ctl.op(static_cast<std::uint8_t>(Op::Shutdown));
     (void)stop;
     ctl.close();
-    WaitForSingleObject(coord.h, 3000); CloseHandle(coord.h); coord.h = nullptr;
+    // The coordinator must really exit on Shutdown (not linger in accept()).
+    std::string exit_out = read_until(coord, "COORD_EXIT");
+    WaitForSingleObject(coord.h, INFINITE);
+    DWORD coord_code = 1; GetExitCodeProcess(coord.h, &coord_code);
+    CloseHandle(coord.h); coord.h = nullptr;
     if (coord.read) { CloseHandle(coord.read); coord.read = nullptr; }
+    REQUIRE(exit_out.find("COORD_EXIT") != std::string::npos && coord_code == 0,
+            "coordinator exited cleanly on Shutdown");
     std::string load_args = "0 " + snapshot + " load";
     Proc coord2 = spawn(coord_exe, load_args);
     std::string l2 = read_until(coord2, "LISTENING");
@@ -292,7 +320,7 @@ int main(int argc, char** argv) {
                 g_failures ? "FAIL" : "PASS", acc, rej, g_failures);
     std::fflush(stdout);
 
-    kill(workerA2); kill(workerB);
+    kill(workerA2); kill(workerB); kill(zombie);
     ctl2.close(); kill(coord2);
     cleanup();
     return g_failures ? 1 : 0;

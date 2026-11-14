@@ -152,7 +152,8 @@ if(STATE_PROVENANCE_BUILD_TESTS)
     tests/test_core.cpp
     tests/test_persist.cpp
     tests/test_concurrency.cpp
-    tests/test_adversarial.cpp)
+    tests/test_adversarial.cpp
+    tests/test_regression.cpp)
   target_include_directories(stateprovenance_tests PRIVATE tests)
   target_link_libraries(stateprovenance_tests PRIVATE StateProvenance::stateprovenance)
   if(WIN32)

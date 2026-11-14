@@ -95,6 +95,9 @@ TEST_CASE(concurrent_invalidation_and_traversal) {
     std::thread reader([&]() {
         while (!stop) { (void)store.descendants(StateId(0x2000)); (void)store.validity_of(StateId(0x2010)); ++reads; }
     });
+    // The reader is traversing before the invalidations start (otherwise the
+    // loop below can finish before the reader thread first runs).
+    while (reads.load() == 0) std::this_thread::yield();
     // invalidate mid-leaf while readers traverse
     for (int i = 0; i < 100; ++i) {
         store.invalidate(InvalidatingSubject{StateId(0x2005), InvalidationReason::DependencyInvalidation, "x"});

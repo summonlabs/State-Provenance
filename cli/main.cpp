@@ -92,7 +92,7 @@ static void load_store(const std::string& path, ProvenanceStore& s) {
     s.roll_state_generation(StateGeneration(1));
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc < 2) return usage();
     std::string cmd = argv[1];
     if (cmd == "register") {
@@ -173,4 +173,10 @@ int main(int argc, char** argv) {
         return 0;
     }
     return usage();
+}
+
+int main(int argc, char** argv) {
+    // A refused snapshot (restore throws) is reported, not a crash.
+    try { return run(argc, argv); }
+    catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 2; }
 }

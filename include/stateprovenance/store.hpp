@@ -52,6 +52,7 @@ struct RecordStatus {
 struct AuthoritySnapshot {
     std::uint64_t epoch = 1;
     std::map<WorkerId, WorkerBootId> boots;
+    std::map<WorkerId, std::set<WorkerBootId>> retired_boots;   // superseded boots per worker
     AttemptId attempt_id;
     AttemptGeneration attempt_generation;
     StateGeneration state_generation;
@@ -76,15 +77,18 @@ public:
     // Publishing
     // ---------------------------------------------------------------
     // Fenced publish: validates the record AND the mutation authority claim.
+    // The claim is evaluated under the same exclusive lock as the insert, so an
+    // epoch roll or boot change cannot land between the check and the insert.
     PublishOutcome publish(const RecordData& data, const AuthorityClaim& claim) {
         auto err = validate_record(data);
         if (err) return {false, *err, nullptr};
 
+        std::unique_lock lk(mu_);
         auto fv = authority_.evaluate_claim(claim);
         if (!fv.accepted())
             return {false, "stale authority [" + fv.dimension + "]: " + fv.detail, nullptr};
 
-        return publish_validated(data);
+        return insert_validated(data);
     }
 
     // Unfenced publish (in-process convenience).  Still validates structure and
@@ -100,8 +104,14 @@ public:
     std::uint64_t roll_epoch() {
         std::unique_lock lk(mu_); return authority_.roll_epoch();
     }
-    void register_boot(WorkerId w, WorkerBootId b) {
-        std::unique_lock lk(mu_); authority_.register_boot(w, b);
+    // Returns false (and changes nothing) for a boot the worker was already
+    // superseded from.  The worker is recorded so its boot is persisted even
+    // before it publishes.
+    bool register_boot(WorkerId w, WorkerBootId b) {
+        std::unique_lock lk(mu_);
+        if (!authority_.register_boot(w, b)) return false;
+        workers_.insert(w);
+        return true;
     }
     void begin_attempt(AttemptId id, AttemptGeneration g) {
         std::unique_lock lk(mu_); authority_.begin_attempt(id, g);
@@ -145,6 +155,7 @@ public:
             auto b = authority_.boot_of(w);
             if (b) s.boots[w] = *b;
         }
+        s.retired_boots = authority_.retired_boots();
         return s;
     }
 
@@ -327,50 +338,29 @@ public:
         return s;
     }
 
+    // Replaces the store's contents with the snapshot.  The snapshot is rebuilt
+    // into a fresh store first, so a refused snapshot (cycle, dangling or
+    // duplicate reference, status for an unknown subject) throws and leaves
+    // this store unchanged.
     void restore(const StoreSnapshot& s) {
+        ProvenanceStore fresh;
+        fresh.rebuild_from(s);
         std::unique_lock lk(mu_);
-        records_.clear();
-        prov_to_state_.clear();
-        graph_ = ProvenanceGraph{};
-        clear_indexes();
-        status_.clear();
-        workers_.clear();
-
-        // Rebuild authority exactly as persisted.
-        authority_ = AuthorityState{};
-        authority_.set_epoch(s.authority.epoch);
-        authority_.begin_attempt(s.authority.attempt_id, s.authority.attempt_generation);
-        authority_.roll_state_generation(s.authority.state_generation);
-        authority_.roll_provenance_generation(s.authority.provenance_generation);
-        authority_.set_artifact_generation(s.authority.artifact_generation);
-        authority_.set_model_generation(s.authority.model_generation);
-        authority_.set_adapter_generation(s.authority.adapter_generation);
-        authority_.set_composition_generation(s.authority.composition_generation);
-        authority_.set_policy_generation(s.authority.policy_generation);
-        authority_.set_dependency_generation(s.authority.dependency_generation);
-        for (const auto& [w, b] : s.authority.boots) {
-            authority_.register_boot(w, b);
-            workers_.insert(w);
-        }
-
-        // Insert records in deterministic topological order so that every parent
-        // is present before its child (required by insert_validated).
-        auto order = records_in_topo_order(s);
-        if (order.size() != s.records.size()) {
-            throw std::runtime_error("restore refused: persisted provenance graph contains a cycle");
-        }
-        for (const auto& rec : order) {
-            auto data = rec->data();
-            insert_validated(data);
-        }
-        // After insertion, restore the live status overlay (validity/invalidation).
-        status_ = s.status;
-        // Maintain the current-validity index against the restored overlay.
-        by_validity_.clear();
-        for (const auto& [id, st] : status_) by_validity_[st.validity].insert(id);
-        for (const auto& [id, rec] : records_) {
-            if (!status_.count(id)) by_validity_[ValidityState::VALID].insert(id);
-        }
+        records_ = std::move(fresh.records_);
+        prov_to_state_ = std::move(fresh.prov_to_state_);
+        graph_ = std::move(fresh.graph_);
+        status_ = std::move(fresh.status_);
+        authority_ = std::move(fresh.authority_);
+        workers_ = std::move(fresh.workers_);
+        by_model_ = std::move(fresh.by_model_);
+        by_adapter_ = std::move(fresh.by_adapter_);
+        by_producer_ = std::move(fresh.by_producer_);
+        by_execution_ = std::move(fresh.by_execution_);
+        by_attempt_ = std::move(fresh.by_attempt_);
+        by_dependency_ = std::move(fresh.by_dependency_);
+        by_artifact_ = std::move(fresh.by_artifact_);
+        by_validity_ = std::move(fresh.by_validity_);
+        by_evidence_ = std::move(fresh.by_evidence_);
     }
 
     std::string store_digest(const StoreSnapshot& s) const {
@@ -389,6 +379,58 @@ public:
     }
 
 private:
+    // Builds this (fresh, not yet shared) store from a snapshot.  Throws
+    // std::runtime_error if the snapshot is refused.
+    void rebuild_from(const StoreSnapshot& s) {
+        // Rebuild authority exactly as persisted.
+        authority_.set_epoch(s.authority.epoch);
+        authority_.begin_attempt(s.authority.attempt_id, s.authority.attempt_generation);
+        authority_.roll_state_generation(s.authority.state_generation);
+        authority_.roll_provenance_generation(s.authority.provenance_generation);
+        authority_.set_artifact_generation(s.authority.artifact_generation);
+        authority_.set_model_generation(s.authority.model_generation);
+        authority_.set_adapter_generation(s.authority.adapter_generation);
+        authority_.set_composition_generation(s.authority.composition_generation);
+        authority_.set_policy_generation(s.authority.policy_generation);
+        authority_.set_dependency_generation(s.authority.dependency_generation);
+        for (const auto& [w, b] : s.authority.boots) {
+            authority_.register_boot(w, b);
+            workers_.insert(w);
+        }
+        for (const auto& [w, boots] : s.authority.retired_boots) {
+            for (WorkerBootId b : boots) {
+                auto cur = authority_.boot_of(w);
+                if (cur && *cur == b)
+                    throw std::runtime_error("restore refused: current boot of worker " + w.to_string() +
+                                             " is also recorded as superseded");
+                authority_.retire_boot(w, b);
+            }
+        }
+
+        // Insert records in deterministic topological order so that every parent
+        // is present before its child (required by insert_validated).
+        auto order = records_in_topo_order(s);
+        if (order.size() != s.records.size()) {
+            throw std::runtime_error("restore refused: persisted provenance graph contains a cycle");
+        }
+        for (const auto& rec : order) {
+            auto out = insert_validated(rec->data());
+            if (!out.ok) throw std::runtime_error("restore refused: " + out.error);
+        }
+        // After insertion, restore the live status overlay (validity/invalidation).
+        for (const auto& [id, st] : s.status) {
+            if (!records_.count(id))
+                throw std::runtime_error("restore refused: status for unknown subject " + id.to_string());
+        }
+        status_ = s.status;
+        // Maintain the current-validity index against the restored overlay.
+        by_validity_.clear();
+        for (const auto& [id, st] : status_) by_validity_[st.validity].insert(id);
+        for (const auto& [id, rec] : records_) {
+            if (!status_.count(id)) by_validity_[ValidityState::VALID].insert(id);
+        }
+    }
+
     PublishOutcome publish_validated(const RecordData& data) {
         std::unique_lock lk(mu_);
         auto err = validate_record(data);
@@ -529,6 +571,7 @@ private:
             auto b = authority_.boot_of(w);
             if (b) s.boots[w] = *b;
         }
+        s.retired_boots = authority_.retired_boots();
         return s;
     }
 

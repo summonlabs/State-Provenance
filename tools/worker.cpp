@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
         std::printf("WORKER_PUBLISH %s %s\n", sid.to_string().c_str(), resp.c_str());
         std::fflush(stdout);
     } else {
-        std::printf("WORKER_REGISTER %s\n", boot.to_string().c_str());
+        std::printf("WORKER_REGISTER %s %s\n", boot.to_string().c_str(), resp.c_str());
         std::fflush(stdout);
     }
 

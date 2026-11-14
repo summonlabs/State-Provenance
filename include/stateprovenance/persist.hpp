@@ -37,7 +37,8 @@ namespace stateprovenance {
 // ---------------------------------------------------------------------------
 // Bounded-length constants
 // ---------------------------------------------------------------------------
-constexpr std::uint32_t kFormatVersion = 1;
+constexpr std::uint32_t kFormatVersion = 2;      // 2 adds superseded worker boots
+constexpr std::uint32_t kMinFormatVersion = 1;   // oldest version still read
 constexpr std::uint64_t kMaxPayloadLen  = 512u * 1024u * 1024u;  // 512 MiB
 constexpr std::uint32_t kMaxStringLen   = 64u * 1024u * 1024u;   // 64 MiB
 constexpr std::uint32_t kMaxVecLen      = 1u << 26;              // 67M elements
@@ -287,6 +288,27 @@ inline std::optional<std::string> read_authority(BinaryReader& r, AuthoritySnaps
     return std::nullopt;
 }
 
+// Format 2: superseded worker boots, as (worker, boot) pairs.
+inline void write_retired_boots(BinaryWriter& w, const AuthoritySnapshot& s) {
+    std::size_t n = 0;
+    for (const auto& [worker, boots] : s.retired_boots) n += boots.size();
+    w.u32(static_cast<std::uint32_t>(n));
+    for (const auto& [worker, boots] : s.retired_boots)
+        for (WorkerBootId b : boots) { w.u64(worker.get()); w.u64(b.get()); }
+}
+
+inline std::optional<std::string> read_retired_boots(BinaryReader& r, AuthoritySnapshot& s) {
+    std::uint32_t n;
+    if (!r.u32(n) || n > kMaxVecLen) return "invalid retired boots count";
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::uint64_t w, b;
+        if (!r.u64(w)) return "truncated retired boots(worker)";
+        if (!r.u64(b)) return "truncated retired boots(boot)";
+        s.retired_boots[WorkerId(w)].insert(WorkerBootId(b));
+    }
+    return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Full snapshot <-> bytes
 // ---------------------------------------------------------------------------
@@ -305,6 +327,7 @@ inline std::vector<std::byte> encode_snapshot(const StoreSnapshot& s) {
         w.str(st.detail);
     }
     write_authority(w, s.authority);
+    write_retired_boots(w, s.authority);
     return w.data();
 }
 
@@ -321,7 +344,7 @@ inline DecodeResult decode_snapshot(const void* data, std::size_t n) {
     if (magic != kPayloadMagic) { res.error = "bad payload magic"; return res; }
     std::uint32_t ver;
     if (!r.u32(ver)) { res.error = "truncated: missing version"; return res; }
-    if (ver != kFormatVersion) { res.error = "unsupported format version"; return res; }
+    if (ver < kMinFormatVersion || ver > kFormatVersion) { res.error = "unsupported format version"; return res; }
 
     std::uint64_t record_count;
     if (!r.u64(record_count)) { res.error = "truncated: missing record count"; return res; }
@@ -360,6 +383,10 @@ inline DecodeResult decode_snapshot(const void* data, std::size_t n) {
     }
     auto aerr = read_authority(r, s.authority);
     if (aerr) { res.error = *aerr; return res; }
+    if (ver >= 2) {
+        auto rerr = read_retired_boots(r, s.authority);
+        if (rerr) { res.error = *rerr; return res; }
+    }
     if (r.remaining() != 0) { res.error = "trailing data after snapshot"; return res; }
 
     res.snapshot = std::move(s);
@@ -434,7 +461,7 @@ inline LoadResult load_file(const std::string& path) {
     for (auto m : kFileMagic) { if (!hr.u8(c) || c != m) { res.error = "bad file magic"; return res; } }
     std::uint32_t ver;
     hr.u32(ver);
-    if (ver != kFormatVersion) { res.error = "unsupported file version"; return res; }
+    if (ver < kMinFormatVersion || ver > kFormatVersion) { res.error = "unsupported file version"; return res; }
     std::uint32_t flags; hr.u32(flags);
     std::uint64_t payload_len; hr.u64(payload_len);
     std::uint32_t crc; hr.u32(crc);
